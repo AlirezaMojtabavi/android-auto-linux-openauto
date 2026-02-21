@@ -6,7 +6,7 @@ This project evaluates and demonstrates the integration of Android Auto on Linux
 
 ---
 
-## ✨ Features
+## Features
 
 - ✅ Wired Android Auto (USB)
 - ✅ Audio routing from Android phone to Linux audio system
@@ -50,7 +50,7 @@ gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
 bluez bluez-tools pulseaudio pulseaudio-module-bluetooth \
 avahi-daemon avahi-utils
 
-## 🔧 Build Critical Dependencies
+## Build Critical Dependencies
 
 
 ### 1) Build Abseil (shared + PIC)
@@ -112,7 +112,7 @@ sudo usermod -aG video,render,input,audio $USER
 
 ---
 
-## 🧪 Test Cases
+## Test Cases
 
 ### 1-Wired Android Auto (USB)
 
@@ -169,4 +169,6 @@ The solution was validated across multiple Android versions and devices.
 - Bluetooth pairing
 - Wireless discovery (experimental)
 
+
+![Android Auto Navigation](pics/navigation.png)
 
