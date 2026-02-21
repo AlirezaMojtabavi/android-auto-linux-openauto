@@ -25,6 +25,11 @@
 #include <f1x/openauto/autoapp/Projection/VideoOutput.hpp>
 #include <f1x/openauto/autoapp/Projection/SequentialBuffer.hpp>
 
+#include <gst/gst.h>
+#include <gst/app/gstappsrc.h>
+#include <gst/video/videooverlay.h>
+
+
 namespace f1x
 {
 namespace openauto
@@ -54,14 +59,22 @@ protected slots:
     void createVideoOutput();
     void onStartPlayback();
     void onStopPlayback();
-    void onMediaStatusChanged(QMediaPlayer::MediaStatus status);
-    void onStateChanged(QMediaPlayer::State state);
-    void onError(QMediaPlayer::Error error);
+//    void onMediaStatusChanged(QMediaPlayer::MediaStatus status);
+//    void onStateChanged(QMediaPlayer::State state);
+//    void onError(QMediaPlayer::Error error);
 
 private:
     void cleanupPlayer();
+    bool ensurePipeline();
     SequentialBuffer videoBuffer_;
-    std::unique_ptr<QVideoWidget> videoWidget_;
+    std::unique_ptr<QWidget> videoWidget_;
+
+    GstElement* pipeline_ = nullptr;
+    GstElement* appsrc_ = nullptr;
+    GstElement* videosink_ = nullptr;
+    bool gstInited_ = false;
+
+
     std::unique_ptr<QMediaPlayer> mediaPlayer_;
     bool playerReady_;
     bool initialBufferingDone_;

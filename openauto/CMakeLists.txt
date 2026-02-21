@@ -12,6 +12,19 @@ string(TIMESTAMP OPENAUTO_BUILD_DAY "%d" UTC)
 
 option(NOPI "Build for Non Raspberry Pi" OFF)
 
+# Local prefix (~/.local) for manually installed deps (aasdk/aap_protobuf)
+set(LOCAL_PREFIX "$ENV{HOME}/.local")
+
+# Make sure compiler sees headers from ~/.local/include
+include_directories(SYSTEM "${LOCAL_PREFIX}/include")
+
+# Make sure linker sees libs from ~/.local/lib
+link_directories("${LOCAL_PREFIX}/lib")
+
+# Runtime search path so executables find ~/.local/lib
+set(CMAKE_BUILD_RPATH "${LOCAL_PREFIX}/lib")
+set(CMAKE_INSTALL_RPATH "${LOCAL_PREFIX}/lib")
+
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTORCC ON)
@@ -124,6 +137,18 @@ find_package(taglib REQUIRED)
 find_package(blkid REQUIRED)
 find_package(gps REQUIRED)
 
+find_package(PkgConfig REQUIRED)
+
+pkg_check_modules(GST REQUIRED
+  gstreamer-1.0
+  gstreamer-app-1.0
+  gstreamer-video-1.0
+)
+
+message(STATUS "GStreamer include dirs: ${GST_INCLUDE_DIRS}")
+message(STATUS "GStreamer libs: ${GST_LIBRARIES}")
+
+
 include_directories(${CMAKE_CURRENT_BINARY_DIR}
         ${Qt5Multimedia_INCLUDE_DIRS}
         ${Qt5MultimediaWidgets_INCLUDE_DIRS}
@@ -152,6 +177,19 @@ set(autoapp_include_directory ${include_directory}/f1x/openauto/autoapp)
 file(GLOB_RECURSE autoapp_source_files ${autoapp_sources_directory}/*.ui ${autoapp_sources_directory}/*.cpp ${autoapp_include_directory}/*.hpp ${autoapp_include_directory}/*.h ${common_include_directory}/*.hpp ${resources_directory}/*.qrc)
 
 add_executable(autoapp ${autoapp_source_files})
+
+target_include_directories(autoapp PRIVATE
+  ${GST_INCLUDE_DIRS}
+)
+
+target_link_libraries(autoapp PRIVATE
+  ${GST_LIBRARIES}
+)
+
+target_compile_options(autoapp PRIVATE
+  ${GST_CFLAGS_OTHER}
+)
+
 
 target_include_directories(autoapp PUBLIC ${AAP_PROTOBUF_INCLUDE_DIR} ${AASDK_INCLUDE_DIR})
 

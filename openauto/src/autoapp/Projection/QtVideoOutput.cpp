@@ -1,69 +1,53 @@
-/*
-*  This file is part of openauto project.
-*  Copyright (C) 2018 f1x.studio (Michal Szwaj)
-*
-*  openauto is free software: you can redistribute it and/or modify
-*  it under the terms of the GNU General Public License as published by
-*  the Free Software Foundation; either version 3 of the License, or
-*  (at your option) any later version.
-
-*  openauto is distributed in the hope that it will be useful,
-*  but WITHOUT ANY WARRANTY; without even the implied warranty of
-*  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*  GNU General Public License for more details.
-*
-*  You should have received a copy of the GNU General Public License
-*  along with openauto. If not, see <http://www.gnu.org/licenses/>.
-*/
-
 #include <QApplication>
 #include <QGuiApplication>
 #include <QScreen>
-#include <mutex>
+#include <QWindow>
+
 #include <f1x/openauto/autoapp/Projection/QtVideoOutput.hpp>
 #include <f1x/openauto/Common/Log.hpp>
 
-namespace f1x
+namespace f1x {
+namespace openauto {
+namespace autoapp {
+namespace projection {
+
+static void ensure_gst_init_once(bool& inited)
 {
-namespace openauto
-{
-namespace autoapp
-{
-namespace projection
-{
+    if (!inited) {
+        int argc = 0;
+        char** argv = nullptr;
+        gst_init(&argc, &argv);
+        inited = true;
+    }
+}
 
 QtVideoOutput::QtVideoOutput(configuration::IConfiguration::Pointer configuration)
     : VideoOutput(std::move(configuration))
-    , playerReady_(false)
-    , initialBufferingDone_(false)
-    , bytesWritten_(0)
 {
     this->moveToThread(QApplication::instance()->thread());
     connect(this, &QtVideoOutput::startPlayback, this, &QtVideoOutput::onStartPlayback, Qt::BlockingQueuedConnection);
-    connect(this, &QtVideoOutput::stopPlayback, this, &QtVideoOutput::onStopPlayback, Qt::BlockingQueuedConnection);
+    connect(this, &QtVideoOutput::stopPlayback,  this, &QtVideoOutput::onStopPlayback,  Qt::BlockingQueuedConnection);
     QMetaObject::invokeMethod(this, "createVideoOutput", Qt::BlockingQueuedConnection);
 }
 
 QtVideoOutput::~QtVideoOutput()
 {
-    OPENAUTO_LOG(info) << "[QtVideoOutput] Destructor called, ensuring cleanup";
-    // Force synchronous cleanup if not already stopped
-    if (playerReady_ || mediaPlayer_) {
-        cleanupPlayer();
-    }
+    OPENAUTO_LOG(info) << "[QtVideoOutput] Destructor";
+    cleanupPlayer();
 }
 
 void QtVideoOutput::createVideoOutput()
 {
     OPENAUTO_LOG(info) << "[QtVideoOutput] createVideoOutput()";
-    videoWidget_ = std::make_unique<QVideoWidget>();
-    mediaPlayer_ = std::make_unique<QMediaPlayer>(nullptr, QMediaPlayer::StreamPlayback);
+    videoWidget_ = std::make_unique<QWidget>();
+    videoWidget_->setAttribute(Qt::WA_NativeWindow, true);
+    videoWidget_->setAttribute(Qt::WA_NoSystemBackground, true);
+    videoWidget_->setAttribute(Qt::WA_OpaquePaintEvent, true);
 }
-
 
 bool QtVideoOutput::open()
 {
-    return videoBuffer_.open(QIODevice::ReadWrite);
+    return true;
 }
 
 bool QtVideoOutput::init()
@@ -77,162 +61,180 @@ void QtVideoOutput::stop()
     emit stopPlayback();
 }
 
-void QtVideoOutput::write(uint64_t, const aasdk::common::DataConstBuffer& buffer)
+bool QtVideoOutput::ensurePipeline()
 {
-    std::lock_guard<std::mutex> lock(writeMutex_);
-    
-    // Skip writes if player is not ready or was stopped
-    if (!playerReady_) {
-        return;
+    if (pipeline_ && appsrc_ && videosink_) return true;
+
+    ensure_gst_init_once(gstInited_);
+
+    // appsrc (H264 byte-stream) -> h264parse -> avdec_h264 -> videoconvert -> ximagesink (overlay)
+    //
+    const char* pipelineDesc =
+        "appsrc name=src is-live=true format=time do-timestamp=true "
+        "! queue "
+        "! h264parse config-interval=-1 "
+        "! avdec_h264 "
+        "! videoconvert "
+        "! autovideosink name=vsink sync=false";
+
+    GError* err = nullptr;
+    pipeline_ = gst_parse_launch(pipelineDesc, &err);
+    if (!pipeline_) {
+        OPENAUTO_LOG(error) << "[QtVideoOutput] gst_parse_launch failed: "
+                            << (err ? err->message : "unknown");
+        if (err) g_error_free(err);
+        return false;
     }
-    
-    // Write data to buffer - the SequentialBuffer will handle the buffering
-    videoBuffer_.write(reinterpret_cast<const char*>(buffer.cdata), buffer.size);
-    bytesWritten_ += buffer.size;
-    
-    // Log initial buffering milestone
-    if (!initialBufferingDone_ && bytesWritten_ >= INITIAL_BUFFER_SIZE)
-    {
-        initialBufferingDone_ = true;
-        OPENAUTO_LOG(info) << "[QtVideoOutput] Initial buffering complete (" << bytesWritten_ << " bytes written)";
+
+    appsrc_ = gst_bin_get_by_name(GST_BIN(pipeline_), "src");
+    videosink_ = gst_bin_get_by_name(GST_BIN(pipeline_), "vsink");
+
+    if (!appsrc_ || !videosink_) {
+        OPENAUTO_LOG(error) << "[QtVideoOutput] Failed to get appsrc/videosink from pipeline";
+        cleanupPlayer();
+        return false;
     }
+
+    GstBus* bus = gst_element_get_bus(pipeline_);
+    gst_bus_add_watch(bus, +[](GstBus*, GstMessage* msg, gpointer selfPtr) -> gboolean {
+        auto* self = static_cast<QtVideoOutput*>(selfPtr);
+
+        switch (GST_MESSAGE_TYPE(msg)) {
+        case GST_MESSAGE_ERROR: {
+            GError* err=nullptr; gchar* dbg=nullptr;
+            gst_message_parse_error(msg, &err, &dbg);
+            OPENAUTO_LOG(error) << "[GStreamer] ERROR: " << (err?err->message:"")
+                                << " dbg=" << (dbg?dbg:"");
+            if(err) g_error_free(err);
+            if(dbg) g_free(dbg);
+            break;
+        }
+        case GST_MESSAGE_ELEMENT: {
+            const GstStructure* s = gst_message_get_structure(msg);
+            if (s && gst_structure_has_name(s, "prepare-window-handle")) {
+                WId wid = self->videoWidget_->winId();
+                gst_video_overlay_set_window_handle(GST_VIDEO_OVERLAY(self->videosink_), (guintptr)wid);
+                gst_video_overlay_handle_events(GST_VIDEO_OVERLAY(self->videosink_), TRUE);
+            }
+            break;
+        }
+        default: break;
+        }
+        return TRUE;
+    }, this);
+    gst_object_unref(bus);
+
+    GstCaps* caps = gst_caps_new_simple("video/x-h264",
+       "stream-format", G_TYPE_STRING, "byte-stream",
+       "alignment",     G_TYPE_STRING, "au",
+       nullptr);
+
+    g_object_set(G_OBJECT(appsrc_),
+                 "caps", caps,
+                 "block", FALSE,
+                 nullptr);
+    gst_caps_unref(caps);
+
+    return true;
 }
 
 void QtVideoOutput::onStartPlayback()
 {
     OPENAUTO_LOG(info) << "[QtVideoOutput] onStartPlayback()";
-    
-    videoWidget_->setAttribute(Qt::WA_OpaquePaintEvent, true);
-    videoWidget_->setAttribute(Qt::WA_NoSystemBackground, true);
-    videoWidget_->setAspectRatioMode(Qt::IgnoreAspectRatio);
-    videoWidget_->setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
-    
-    // Get the physical screen geometry and set widget to exactly match it
-    QScreen *screen = QGuiApplication::primaryScreen();
-    if (screen != nullptr) {
-        QRect screenGeometry = screen->geometry();
-        videoWidget_->setGeometry(screenGeometry);
-        OPENAUTO_LOG(info) << "[QtVideoOutput] Set video widget geometry to: " 
-                           << screenGeometry.width() << "x" << screenGeometry.height()
-                           << " at (" << screenGeometry.x() << "," << screenGeometry.y() << ")";
-    } else {
-        // Fallback to fullscreen if screen detection fails
-        videoWidget_->setFullScreen(true);
-        OPENAUTO_LOG(warning) << "[QtVideoOutput] Could not detect screen, using setFullScreen()";
+
+    if (!ensurePipeline()) {
+        OPENAUTO_LOG(error) << "[QtVideoOutput] Pipeline creation failed";
+        return;
     }
-    
-    videoWidget_->raise();
+
+    QScreen* screen = QGuiApplication::primaryScreen();
+    if (screen) {
+        QRect g = screen->geometry();
+        videoWidget_->setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
+        videoWidget_->setGeometry(g);
+        OPENAUTO_LOG(info) << "[QtVideoOutput] Widget geometry: "
+                           << g.width() << "x" << g.height()
+                           << " at (" << g.x() << "," << g.y() << ")";
+    } else {
+        videoWidget_->setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
+        videoWidget_->showFullScreen();
+        OPENAUTO_LOG(warning) << "[QtVideoOutput] No screen detected, using showFullScreen()";
+    }
+
     videoWidget_->show();
-    videoWidget_->setFocus();
+    videoWidget_->raise();
     videoWidget_->activateWindow();
 
-    // Connect state change signals to track when player is ready
-    connect(mediaPlayer_.get(), &QMediaPlayer::mediaStatusChanged, this, &QtVideoOutput::onMediaStatusChanged);
-    connect(mediaPlayer_.get(), &QMediaPlayer::stateChanged, this, &QtVideoOutput::onStateChanged);
-    connect(mediaPlayer_.get(), static_cast<void(QMediaPlayer::*)(QMediaPlayer::Error)>(&QMediaPlayer::error), 
-            this, &QtVideoOutput::onError);
-    
-    mediaPlayer_->setVideoOutput(videoWidget_.get());
-    mediaPlayer_->setMedia(QMediaContent(), &videoBuffer_);
-    mediaPlayer_->play();
-    
-    // Mark as ready immediately after calling play() since we're using blocking connection
+    // embed sink into Qt window using VideoOverlay
+    WId wid = videoWidget_->winId();
+//    gst_video_overlay_set_window_handle(GST_VIDEO_OVERLAY(videosink_), static_cast<guintptr>(wid));
+
+    // Start pipeline
+    GstStateChangeReturn ret = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        OPENAUTO_LOG(error) << "[QtVideoOutput] Failed to set pipeline to PLAYING";
+        cleanupPlayer();
+        return;
+    }
+
     {
         std::lock_guard<std::mutex> lock(writeMutex_);
         playerReady_ = true;
     }
 
-    OPENAUTO_LOG(info) << "[QtVideoOutput] Player started and marked ready";
-    OPENAUTO_LOG(debug) << "[QtVideoOutput] Player error state -> " << mediaPlayer_->errorString().toStdString();
+    OPENAUTO_LOG(info) << "[QtVideoOutput] Pipeline set to PLAYING, ready to receive buffers";
 }
 
-void QtVideoOutput::cleanupPlayer()
+void QtVideoOutput::write(uint64_t /*timestamp*/, const aasdk::common::DataConstBuffer& buffer)
 {
-    // Stop the player with timeout protection
-    if (mediaPlayer_) {
-        OPENAUTO_LOG(debug) << "[QtVideoOutput] Stopping media player";
-        mediaPlayer_->stop();
-        mediaPlayer_->setMedia(QMediaContent());
-    }
-    
-    // Hide video widget
-    if (videoWidget_) {
-        videoWidget_->hide();
-        videoWidget_->clearFocus();
+    std::lock_guard<std::mutex> lock(writeMutex_);
+    if (!playerReady_ || !appsrc_) return;
+
+    // Create GstBuffer and push into appsrc
+    GstBuffer* gstbuf = gst_buffer_new_allocate(nullptr, buffer.size, nullptr);
+    if (!gstbuf) return;
+
+    gst_buffer_fill(gstbuf, 0, buffer.cdata, buffer.size);
+
+    GstFlowReturn fr = gst_app_src_push_buffer(GST_APP_SRC(appsrc_), gstbuf);
+    if (fr != GST_FLOW_OK) {
+        OPENAUTO_LOG(error) << "[QtVideoOutput] gst_app_src_push_buffer failed: " << fr;
+        playerReady_ = false;
     }
 }
 
 void QtVideoOutput::onStopPlayback()
 {
     OPENAUTO_LOG(info) << "[QtVideoOutput] onStopPlayback()";
-    
-    std::lock_guard<std::mutex> lock(writeMutex_);
-    playerReady_ = false;
-    initialBufferingDone_ = false;
-    bytesWritten_ = 0;
-    
-    cleanupPlayer();
-    
-    OPENAUTO_LOG(info) << "[QtVideoOutput] onStopPlayback() complete";
-}
-
-void QtVideoOutput::onMediaStatusChanged(QMediaPlayer::MediaStatus status)
-{
-    OPENAUTO_LOG(debug) << "[QtVideoOutput] Media status changed: " << status;
-    
-    // Mark player as ready when buffering or buffered
-    if (status == QMediaPlayer::BufferingMedia || status == QMediaPlayer::BufferedMedia)
-    {
-        std::lock_guard<std::mutex> lock(writeMutex_);
-        playerReady_ = true;
-        OPENAUTO_LOG(info) << "[QtVideoOutput] Player is now ready to receive data";
-    }
-}
-
-void QtVideoOutput::onStateChanged(QMediaPlayer::State state)
-{
-    OPENAUTO_LOG(debug) << "[QtVideoOutput] Player state changed: " << state;
-    
-    // Mark player as ready when playing state is reached
-    if (state == QMediaPlayer::PlayingState)
-    {
-        std::lock_guard<std::mutex> lock(writeMutex_);
-        playerReady_ = true;
-        OPENAUTO_LOG(info) << "[QtVideoOutput] Player entered PLAYING state";
-    }
-    else if (state == QMediaPlayer::StoppedState)
     {
         std::lock_guard<std::mutex> lock(writeMutex_);
         playerReady_ = false;
-        OPENAUTO_LOG(info) << "[QtVideoOutput] Player stopped";
     }
+    cleanupPlayer();
 }
 
-void QtVideoOutput::onError(QMediaPlayer::Error error)
+void QtVideoOutput::cleanupPlayer()
 {
-    OPENAUTO_LOG(error) << "[QtVideoOutput] Media player error occurred!";
-    OPENAUTO_LOG(error) << "[QtVideoOutput] Error code: " << error;
-    OPENAUTO_LOG(error) << "[QtVideoOutput] Error string: " << mediaPlayer_->errorString().toStdString();
-    
-    // Provide helpful error messages for common issues
-    if (error == QMediaPlayer::FormatError)
-    {
-        OPENAUTO_LOG(error) << "[QtVideoOutput] FORMAT ERROR - This usually means a required codec is missing";
-        OPENAUTO_LOG(error) << "[QtVideoOutput] Video codec required: H.264";
-        OPENAUTO_LOG(error) << "[QtVideoOutput] Please install: sudo apt-get install gstreamer1.0-libav gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly";
+    if (pipeline_) {
+        gst_element_set_state(pipeline_, GST_STATE_NULL);
     }
-    else if (error == QMediaPlayer::ResourceError)
-    {
-        OPENAUTO_LOG(error) << "[QtVideoOutput] RESOURCE ERROR - Failed to allocate resources for playback";
+
+    if (appsrc_) {
+        gst_object_unref(appsrc_);
+        appsrc_ = nullptr;
     }
-    else if (error == QMediaPlayer::ServiceMissingError)
-    {
-        OPENAUTO_LOG(error) << "[QtVideoOutput] SERVICE MISSING - GStreamer backend may not be properly installed";
-        OPENAUTO_LOG(error) << "[QtVideoOutput] Please install: sudo apt-get install gstreamer1.0-plugins-base gstreamer1.0-plugins-good";
+    if (videosink_) {
+        gst_object_unref(videosink_);
+        videosink_ = nullptr;
+    }
+    if (pipeline_) {
+        gst_object_unref(pipeline_);
+        pipeline_ = nullptr;
+    }
+
+    if (videoWidget_) {
+        videoWidget_->hide();
     }
 }
 
-}
-}
-}
-}
+} } } }
