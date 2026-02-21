@@ -56,7 +56,9 @@ avahi-daemon avahi-utils
 ### 1) Build Abseil (shared + PIC)
 
 git clone https://github.com/abseil/abseil-cpp.git
+
 cd abseil-cpp
+
 mkdir build && cd build
 
 cmake -DCMAKE_BUILD_TYPE=Release \
@@ -75,7 +77,9 @@ sudo ldconfig
 ### 2) Build Protobuf v6.30.0 (shared + PIC)
 
 git clone https://github.com/protocolbuffers/protobuf.git
+
 cd protobuf
+
 git checkout v6.30.0
 
 mkdir build && cd build
